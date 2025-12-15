@@ -1,0 +1,217 @@
+name: build signal-cli linux (x64/arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish (e.g. v0.13.22). Required for manual run."
+        required: true
+        type: string
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.arch_label }} on UBI10
+    runs-on: ${{ matrix.runs_on }}
+
+    container:
+      image: registry.access.redhat.com/ubi10/ubi
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: linux-x64
+            runs_on: ubuntu-24.04
+            rpm_arch: x86_64
+
+          - arch_label: linux-arm64
+            runs_on: ubuntu-24.04-arm
+            rpm_arch: aarch64
+
+    steps:
+      - name: Compute version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.release_tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+
+          RPM_VERSION="${VERSION#v}"
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "RPM_VERSION=$RPM_VERSION" >> "$GITHUB_ENV"
+          echo "Resolved VERSION=$VERSION ; RPM_VERSION=$RPM_VERSION"
+
+      - name: Install build dependencies (UBI10)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf -y update
+
+          # NOTE:
+          # - rpmbuild: build rpm
+          # - java-17-openjdk-headless: runtime requirement for signal-cli wrapper testing
+          # - bsdtar optional; we use tar
+          dnf -y install \
+            git ca-certificates curl \
+            bash coreutils findutils which \
+            tar gzip xz \
+            rpm-build rpmdevtools redhat-rpm-config \
+            java-17-openjdk-headless
+
+          dnf -y clean all
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sanity check (arch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[*] uname -m: $(uname -m)"
+          echo "[*] expected rpm_arch: ${{ matrix.rpm_arch }}"
+
+      - name: Package tar.gz (from upstream release)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # For non-tag pushes we still create a tarball, but it will contain the
+          # resolved VERSION (dev-xxxx). This mirrors your magicbot workflow style.
+          VER="${RPM_VERSION}"
+
+          OUTDIR="dist/${{ matrix.arch_label }}"
+          mkdir -p "$OUTDIR"
+
+          # We do not assume package script exists for non-release builds.
+          # Instead, always fetch upstream artifacts and pack them.
+          BASE_URL="https://github.com/AsamK/signal-cli/releases/download/v${VER}"
+          JAR="signal-cli-${VER}.jar"
+
+          case "${{ matrix.rpm_arch }}" in
+            x86_64)  LIB_ARCH="linux-x86_64" ;;
+            aarch64) LIB_ARCH="linux-aarch64" ;;
+            *) echo "unsupported rpm_arch: ${{ matrix.rpm_arch }}"; exit 1 ;;
+          esac
+
+          LIB_TAR="libsignal-client-${VER}-${LIB_ARCH}.tar.gz"
+
+          echo "[*] Downloading: $BASE_URL/$JAR"
+          curl -fL -o "$OUTDIR/$JAR" "$BASE_URL/$JAR"
+
+          echo "[*] Downloading: $BASE_URL/$LIB_TAR"
+          curl -fL -o "$OUTDIR/$LIB_TAR" "$BASE_URL/$LIB_TAR"
+
+          # Create a simple bundle layout for tar.gz artifact
+          BUNDLE_DIR="signal-cli-${VERSION}-${{ matrix.arch_label }}"
+          TMPDIR="$(mktemp -d)"
+          mkdir -p "$TMPDIR/$BUNDLE_DIR/lib"
+
+          cp -f "$OUTDIR/$JAR" "$TMPDIR/$BUNDLE_DIR/"
+          tar -xf "$OUTDIR/$LIB_TAR" -C "$TMPDIR/$BUNDLE_DIR/"
+
+          # Normalize libs into $BUNDLE_DIR/lib if upstream tar layout differs
+          if [[ -d "$TMPDIR/$BUNDLE_DIR/lib" ]]; then
+            :
+          fi
+          # move any libsignal*.so into lib/
+          find "$TMPDIR/$BUNDLE_DIR" -maxdepth 3 -type f -name "libsignal*.so" -exec mv -f {} "$TMPDIR/$BUNDLE_DIR/lib/" \; || true
+
+          # Wrapper (tarball version; rpm wrapper is handled by package script)
+          cat > "$TMPDIR/$BUNDLE_DIR/signal-cli" <<EOF
+          #!/usr/bin/env bash
+          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          export LD_LIBRARY_PATH="\$DIR/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+          exec java -jar "\$DIR/$JAR" "\$@"
+          EOF
+          chmod +x "$TMPDIR/$BUNDLE_DIR/signal-cli"
+
+          ARCHIVE="signal-cli-${VERSION}-${{ matrix.arch_label }}.tar.gz"
+          (cd "$TMPDIR" && tar -czf "$OUTDIR/$ARCHIVE" "$BUNDLE_DIR")
+
+          rm -rf "$TMPDIR"
+
+          test -f "$OUTDIR/$ARCHIVE"
+          echo "[OK] Created $OUTDIR/$ARCHIVE"
+
+      - name: Build RPM (package-signalcli-rhel.sh)
+        if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f ./package-signalcli-rhel.sh
+          chmod +x ./package-signalcli-rhel.sh
+
+          # Pass version without leading v
+          ./package-signalcli-rhel.sh --version "${RPM_VERSION}"
+
+          OUTDIR="dist/${{ matrix.arch_label }}"
+          mkdir -p "$OUTDIR"
+
+          if [ -d "$HOME/rpmbuild/RPMS" ]; then
+            find "$HOME/rpmbuild/RPMS" -type f -name "*.rpm" -exec cp -v {} "$OUTDIR/" \;
+          fi
+
+          test -n "$(ls -1 "$OUTDIR"/*.rpm 2>/dev/null)"
+
+      - name: Upload artifact (tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-cli-${{ env.VERSION }}-${{ matrix.arch_label }}
+          path: dist/${{ matrix.arch_label }}/signal-cli-${{ env.VERSION }}-${{ matrix.arch_label }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload artifact (rpm)
+        if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-cli-${{ env.VERSION }}-${{ matrix.arch_label }}-rpm
+          path: dist/${{ matrix.arch_label }}/*.rpm
+          if-no-files-found: error
+
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Compute release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create / Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: |
+            dist/**/signal-cli-*.tar.gz
+            dist/**/*.rpm
