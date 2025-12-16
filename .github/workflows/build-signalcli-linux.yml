@@ -71,9 +71,12 @@ jobs:
           ls -l /etc/yum.repos.d || true
           sed -n '1,200p' /etc/yum.repos.d/*.repo 2>/dev/null || true
 
+          # NOTE:
+          # UBI10 base images often ship coreutils-single; installing coreutils will conflict.
+          # So do NOT install coreutils here.
           dnf -y install \
             git ca-certificates curl \
-            bash coreutils findutils which \
+            bash findutils which \
             tar gzip xz \
             rpm-build rpmdevtools redhat-rpm-config \
             || exit 1
