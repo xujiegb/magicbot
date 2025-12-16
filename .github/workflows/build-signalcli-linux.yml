@@ -62,16 +62,24 @@ jobs:
           set -euo pipefail
           dnf -y update
 
-          # NOTE:
-          # - rpmbuild: build rpm
-          # - java-17-openjdk-headless: runtime requirement for signal-cli wrapper testing
-          # - bsdtar optional; we use tar
+          echo "===== ENABLED REPOS ====="
+          dnf repolist --enabled || true
+          echo "===== ALL REPOS ====="
+          dnf repolist || true
+
+          echo "===== REPO FILES ====="
+          ls -l /etc/yum.repos.d || true
+          sed -n '1,200p' /etc/yum.repos.d/*.repo 2>/dev/null || true
+
           dnf -y install \
             git ca-certificates curl \
             bash coreutils findutils which \
             tar gzip xz \
             rpm-build rpmdevtools redhat-rpm-config \
-            java-17-openjdk-headless
+            || exit 1
+
+          # optional java (try 21 then 17; don't fail workflow if unavailable)
+          dnf -y install java-21-openjdk-headless || dnf -y install java-17-openjdk-headless || true
 
           dnf -y clean all
 
