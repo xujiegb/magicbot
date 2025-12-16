@@ -143,6 +143,7 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
+	ensure_default_path();
 	ensure_dirs()?;
 	let args: Vec<String> = env::args().collect();
 	if args.len() >= 2 && args[1] == "--daemon" {
@@ -156,6 +157,22 @@ fn real_main() -> Result<()> {
 	}
 	show_menu()?;
 	Ok(())
+}
+
+// PATCH 1: 确保 /usr/local/bin 在 PATH（你现场 root PATH 没它，导致 magicbot 内部永远找不到 signal-cli）
+fn ensure_default_path() {
+	let mut p = env::var("PATH").unwrap_or_default();
+	if !p.split(':').any(|x| x == "/usr/local/bin") {
+		if p.is_empty() {
+			p = "/usr/local/bin".to_string();
+		} else {
+			p = format!("/usr/local/bin:{p}");
+		}
+	}
+	if !p.split(':').any(|x| x == "/usr/local/sbin") {
+		p = format!("/usr/local/sbin:{p}");
+	}
+	env::set_var("PATH", p);
 }
 
 fn ensure_dirs() -> Result<()> {
@@ -312,10 +329,12 @@ fn install_deps() -> Result<()> {
 	Ok(())
 }
 
+// PATCH 2: linkdevice 不再 cmd.output() 死等退出，改为 timeout + 正则抓 URI；并追加 PNG 兜底二维码
 fn login_linkdevice(gc: &mut GlobalConfig) -> Result<()> {
 	require_root()?;
 	ensure_cmd("signal-cli")?;
 	ensure_cmd("qrencode")?;
+	ensure_cmd("timeout")?; // coreutils timeout
 
 	let cfgdir = Input::<String>::with_theme(&theme())
 		.with_prompt("signal-cli --config 目录(留空用默认)")
@@ -332,24 +351,48 @@ fn login_linkdevice(gc: &mut GlobalConfig) -> Result<()> {
 		.interact_text()?;
 	let name = if name.trim().is_empty() { "magicbot".to_string() } else { name };
 
-	let mut cmd = Command::new("signal-cli");
+	// 用 timeout 包一层：只要拿到 URI 就继续（即使 signal-cli 不退出）
+	let mut cmd = Command::new("timeout");
+	cmd.arg("15s").arg("signal-cli");
 	if let Some(dir) = &gc.signal_cli_config_dir {
 		cmd.arg("--config").arg(dir);
 	}
-	cmd.arg("link").arg("-n").arg(name);
+	cmd.arg("link").arg("-n").arg(&name);
 
-	let out = cmd.output().context("signal-cli link failed")?;
-	let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	if s.is_empty() {
-		return Err(anyhow!(
-			"signal-cli link returned empty output. stderr={}",
+	let out = cmd.output().context("signal-cli link (timeout wrapper) failed")?;
+
+	// signal-cli 的 INFO 可能在 stderr；URI 可能在 stdout
+	let mut combined = String::new();
+	combined.push_str(&String::from_utf8_lossy(&out.stdout));
+	combined.push('\n');
+	combined.push_str(&String::from_utf8_lossy(&out.stderr));
+
+	let uri = extract_linkdevice_uri(&combined).ok_or_else(|| {
+		anyhow!(
+			"signal-cli link did not produce linkdevice URI. status={:?} stdout={} stderr={}",
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout),
 			String::from_utf8_lossy(&out.stderr)
-		));
-	}
+		)
+	})?;
 
-	println!("\n[OK] Link URI:\n{s}\n");
+	println!("\n[OK] Link URI:\n{uri}\n");
+	std::io::stdout().flush().ok();
+
 	println!("[INF] QRCode(ANSI):\n");
-	run_ok(Command::new("qrencode").arg("-t").arg("ANSIUTF8").arg(&s))?;
+	let _ = run_ok(Command::new("qrencode").arg("-t").arg("ANSIUTF8").arg(&uri));
+
+	// PNG 兜底：ANSI 在部分终端会看不到/乱码
+	let png = PathBuf::from(RUN_DIR).join("linkdevice.png");
+	let _ = fs::create_dir_all(RUN_DIR);
+	let _ = run_ok(
+		Command::new("qrencode")
+			.arg("-o")
+			.arg(&png)
+			.arg(&uri),
+	);
+	println!("\n[INF] PNG QRCode(兜底): {}", png.display());
+	std::io::stdout().flush().ok();
 
 	println!("\n[INF] 绑定完成后，需要在本机选择一个账号进行后续操作。");
 	println!("[INF] 如果你是“链接设备”，账号由主设备决定；一般无需输入手机号。");
@@ -370,6 +413,13 @@ fn login_linkdevice(gc: &mut GlobalConfig) -> Result<()> {
 	save_global(gc)?;
 	println!("[OK] 当前账号 = {}", accs[i]);
 	Ok(())
+}
+
+fn extract_linkdevice_uri(s: &str) -> Option<String> {
+	// 例：sgnl://linkdevice?uuid=...&pub_key=...
+	// stdout/stderr 可能混杂其他文本，所以用 regex 取整段
+	let re = Regex::new(r"(sgnl://linkdevice\?[^\s]+)").ok()?;
+	re.captures(s).map(|c| c[1].to_string())
 }
 
 fn register_sms_flow(gc: &mut GlobalConfig) -> Result<()> {
@@ -1454,36 +1504,26 @@ fn build_identity_name_map(acc: &str, cfgdir: Option<&str>) -> Result<HashMap<St
 	Ok(map)
 }
 
+// PATCH 3: 本机账号发现改为 listAccounts（不再从 listGroups/members 猜）
+// 同时兼容：号码可能在 stdout 或 stderr（INFO 混到 stderr）
 fn list_local_accounts(gc: &GlobalConfig) -> Result<Vec<String>> {
-
 	let mut cmd = Command::new("signal-cli");
 	if let Some(dir) = &gc.signal_cli_config_dir {
 		cmd.arg("--config").arg(dir);
 	}
-	cmd.arg("-o").arg("json").arg("listGroups");
+	cmd.arg("listAccounts");
 
-	let out = cmd.output()?;
-	let s = String::from_utf8_lossy(&out.stdout).to_string();
-	if s.trim().is_empty() {
-		return Ok(vec![]);
-	}
+	let out = cmd.output().context("signal-cli listAccounts failed")?;
+	let mut combined = String::new();
+	combined.push_str(&String::from_utf8_lossy(&out.stdout));
+	combined.push('\n');
+	combined.push_str(&String::from_utf8_lossy(&out.stderr));
 
-	let v: Value = serde_json::from_str(&s)?;
-	let empty = vec![];
-	let arr = v.as_array().unwrap_or(&empty);
+	let re_phone = Regex::new(r"(\+\d{6,20})")?;
 	let mut cand = BTreeSet::new();
-	for g in arr {
-		if let Some(m) = g.get("members").and_then(|x| x.as_array()) {
-			for it in m {
-				if let Some(n) = it.get("number").and_then(|x| x.as_str()) {
-					if n.starts_with('+') {
-						cand.insert(n.to_string());
-					}
-				}
-			}
-		}
+	for c in re_phone.captures_iter(&combined) {
+		cand.insert(c[1].to_string());
 	}
-
 	Ok(cand.into_iter().collect())
 }
 
